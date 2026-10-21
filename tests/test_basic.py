@@ -18,6 +18,8 @@ from werkzeug.routing import BuildError
 from werkzeug.routing import RequestRedirect
 
 import flask
+from flask.globals import request_ctx
+from flask.testing import FlaskClient
 
 
 require_cpython_gc = pytest.mark.skipif(
@@ -228,27 +230,144 @@ def test_endpoint_decorator(app, client):
     assert client.get("/foo/bar").data == b"bar"
 
 
-def test_session(app, client):
-    @app.route("/set", methods=["POST"])
-    def set():
-        assert not flask.session.accessed
-        assert not flask.session.modified
+def test_session_accessed(app: flask.Flask, client: FlaskClient) -> None:
+    @app.post("/")
+    def do_set():
         flask.session["value"] = flask.request.form["value"]
-        assert flask.session.accessed
-        assert flask.session.modified
         return "value set"
 
-    @app.route("/get")
-    def get():
-        assert not flask.session.accessed
-        assert not flask.session.modified
-        v = flask.session.get("value", "None")
-        assert flask.session.accessed
-        assert not flask.session.modified
-        return v
+    @app.get("/")
+    def do_get():
+        return flask.session.get("value", "None")
 
-    assert client.post("/set", data={"value": "42"}).data == b"value set"
-    assert client.get("/get").data == b"42"
+    @app.get("/nothing")
+    def do_nothing() -> str:
+        return ""
+
+    with client:
+        rv = client.get("/nothing")
+        assert "cookie" not in rv.vary
+        assert not request_ctx._session.accessed
+        assert not request_ctx._session.modified
+
+    with client:
+        rv = client.post(data={"value": "42"})
+        assert rv.text == "value set"
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
+        assert request_ctx._session.modified
+
+    with client:
+        rv = client.get()
+        assert rv.text == "42"
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
+        assert not request_ctx._session.modified
+
+    with client:
+        rv = client.get("/nothing")
+        assert rv.text == ""
+        assert "cookie" not in rv.vary
+        assert not request_ctx._session.accessed
+        assert not request_ctx._session.modified
+
+
+@pytest.mark.parametrize("logged_in", [True, False], ids=["logged-in", "anonymous"])
+@pytest.mark.parametrize(
+    "access",
+    [
+        pytest.param(lambda s: "user_id" in s, id="contains"),
+        pytest.param(lambda s: "user_id" not in s, id="not-contains"),
+        pytest.param(len, id="len"),
+        pytest.param(bool, id="bool"),
+        pytest.param(list, id="iter"),
+        pytest.param(lambda s: list(s.keys()), id="keys"),
+        pytest.param(lambda s: list(s.values()), id="values"),
+        pytest.param(lambda s: list(s.items()), id="items"),
+        pytest.param(lambda s: s == {"user_id": 1}, id="eq"),
+        pytest.param(lambda s: s.copy(), id="copy"),
+    ],
+)
+def test_session_read_only_access_vary(
+    app: flask.Flask, client: FlaskClient, access, logged_in: bool
+) -> None:
+    # Reading the session without indexing a value (for example checking
+    # if a key is present) must still add "Vary: Cookie", otherwise a
+    # caching proxy may serve one user's session dependent page to others.
+    @app.get("/")
+    def index():
+        return "user" if access(flask.session) else "other"
+
+    if logged_in:
+        with client.session_transaction() as sess:
+            sess["user_id"] = 1
+
+    with client:
+        rv = client.get("/")
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
+        assert not request_ctx._session.modified
+
+
+def test_session_template_access_vary(app: flask.Flask, client: FlaskClient) -> None:
+    @app.get("/")
+    def index():
+        return flask.render_template_string(
+            "{% if 'user_id' in session %}user{% else %}anonymous{% endif %}"
+        )
+
+    @app.get("/plain")
+    def plain():
+        return flask.render_template_string("{{ request.path }}")
+
+    with client:
+        rv = client.get("/")
+        assert rv.text == "anonymous"
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+
+    with client:
+        rv = client.get("/")
+        assert rv.text == "user"
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
+
+    # Rendering a template that does not use the session does not mark
+    # it as accessed.
+    with client:
+        rv = client.get("/plain")
+        assert rv.text == "/plain"
+        assert "cookie" not in rv.vary
+        assert not request_ctx._session.accessed
+
+
+def test_session_request_context_attribute(
+    app: flask.Flask, client: FlaskClient
+) -> None:
+    ctx = app.test_request_context()
+    assert ctx.session is None
+
+    with ctx:
+        assert ctx.session is not None
+        assert ctx.session.accessed
+
+    @app.get("/")
+    def index():
+        # The session on the request context can still be replaced.
+        new_session = app.session_interface.session_class({"user_id": 1})
+        request_ctx.session = new_session
+        assert request_ctx._session is new_session
+        assert not new_session.accessed
+        return "user" if "user_id" in flask.session else "anonymous"
+
+    with client:
+        rv = client.get("/")
+        assert rv.text == "user"
+        assert "cookie" in rv.vary
+        assert request_ctx._session.accessed
 
 
 def test_session_path(app, client):
